@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Validate root permissions before proceeding
+if [[ $EUID -ne 0 ]]; then
+  echo "[ERROR] This script must be run as root (use sudo)."
+  exit 1
+fi
+
+CADDY_PATH=/etc/caddy
+NGINX_PATH=/etc/nginx
+LETSENCRYPT_PATH=/etc/letsencrypt
+
+SERVER="auto"
+ACTION=""
+DOMAIN=""
+PORT=""
+NAKED=""
+EMAIL=""
+SPA_MODE=0
+SECURE=1
+WILDCARD=0
+JSON_OUTPUT=0
+
+# ------------------------
+# HELP & USAGE
+# ------------------------
+help() {
+  echo ""
+  echo -e "\e[1mvhost - Quick Virtual Host Manager for Caddy & Nginx\e[0m"
+  echo "------------------------------------------------------"
+  echo -e "\e[1mUsage:\e[0m vhost <action> [options] [domain]"
+  echo ""
+  echo -e "\e[1mActions:\e[0m"
+  echo "  add       Creates a new virtual host"
+  echo "  remove    Deletes an existing virtual host"
+  echo "  list      Lists all configured domains"
+  echo "  inspect   Shows detailed info about a specific domain"
+  echo ""
+  echo -e "\e[1mOptions (for 'add'):\e[0m"
+  echo "  -p <port>        Reverse proxy target port (e.g., 3000)"
+  echo "  -n <domain>      Naked domain redirect (e.g., domain.com -> www.domain.com)"
+  echo "  -e <email>       Email for Let's Encrypt notifications (recommended)"
+  echo "  -a               Enable SPA mode (fallback routing to index.html)"
+  echo "  -s               Force HTTPS redirect (Default)"
+  echo "  --wildcard       Enable wildcard SSL (*.domain.com)"
+  echo ""
+  echo -e "\e[1mGlobal Options:\e[0m"
+  echo "  --caddy          Force Caddy server detection"
+  echo "  --nginx          Force Nginx server detection"
+  echo "  --json           Output results in JSON format (for list & inspect)"
+  echo ""
+  echo -e "\e[1mExamples:\e[0m"
+  echo "  vhost add -p 3000 myapp.com"
+  echo "  vhost add -a -n myapp.com www.myapp.com"
+  echo "  vhost list --json"
+  echo "  vhost inspect myapp.com"
+  echo ""
+}
+
+# ------------------------
+# VALIDATIONS
+# ------------------------
+validate_dns() {
+  # Skip DNS check if JSON output is requested to keep output clean
+  [[ $JSON_OUTPUT -eq 1 ]] && return
+
+  if ! command -v dig &> /dev/null; then
+    echo "[WARN] 'dig' is not installed. Skipping DNS validation..."
+    return
+  fi
+
+  SERVER_IP=$(curl -s ifconfig.me || true)
+  DOMAIN_IP=$(dig +short $DOMAIN | tail -n1)
+
+  if [[ -z "$DOMAIN_IP" ]]; then
+    echo "[WARN] No DNS record found for $DOMAIN"
+    echo "       → Configure A record before enabling SSL"
+    return
+  fi
+
+  if [[ "$SERVER_IP" != "$DOMAIN_IP" ]]; then
+    echo "[WARN] DNS mismatch: Server IP is $SERVER_IP, Domain IP is $DOMAIN_IP."
+    echo "       → SSL generation may fail."
+  else
+    echo "[OK] DNS points correctly to this server."
+  fi
+}
+
+validate_port() {
+  [[ $JSON_OUTPUT -eq 1 ]] && return
+  if [[ -n "$PORT" ]]; then
+    if ss -tuln | grep -q ":$PORT"; then
+      echo "[OK] Service detected on port $PORT"
+    else
+      echo "[WARN] No service listening on port $PORT yet."
+    fi
+  fi
+}
+
+check_dependencies() {
+  if [[ "$SERVER" == "caddy" && ! $(command -v caddy) ]]; then
+    echo "[ERROR] Caddy not installed"
+    exit 1
+  fi
+  if [[ "$SERVER" == "nginx" && ! $(command -v nginx) ]]; then
+    echo "[ERROR] Nginx not installed"
+    exit 1
+  fi
+}
+
+detect_server() {
+  if command -v caddy >/dev/null 2>&1; then
+    SERVER="caddy"
+  elif command -v nginx >/dev/null 2>&1; then
+    SERVER="nginx"
+  else
+    echo "[ERROR] No supported web server found (caddy/nginx)"
+    exit 1
+  fi
+}
+
+# ------------------------
+# ARG PARSE
+# ------------------------
+if [[ $# -lt 1 ]]; then
+  help
+  exit 1
+fi
+
+ACTION=$1
+shift
+
+# Validate action
+if [[ ! "$ACTION" =~ ^(add|remove|list|inspect)$ ]]; then
+  echo "[ERROR] Invalid action: $ACTION"
+  help
+  exit 1
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p) PORT="$2"; shift 2;;
+    -n) NAKED="$2"; shift 2;;
+    -e) EMAIL="$2"; shift 2;;
+    -a) SPA_MODE=1; shift;;
+    -s) SECURE=1; shift;;
+    --wildcard) WILDCARD=1; shift;;
+    --caddy) SERVER="caddy"; shift;;
+    --nginx) SERVER="nginx"; shift;;
+    --json) JSON_OUTPUT=1; shift;;
+    -h|--help) help; exit 0;;
+    *) DOMAIN="$1"; shift;;
+  esac
+done
+
+if [[ "$SERVER" == "auto" ]]; then
+  detect_server
+fi
+
+check_dependencies
+
+# Require domain for all actions except 'list'
+if [[ -z "$DOMAIN" && "$ACTION" != "list" ]]; then
+  echo "[ERROR] Domain required for action '$ACTION'"
+  exit 1
+fi
+
+# Print info header only if not JSON
+if [[ $JSON_OUTPUT -eq 0 && "$ACTION" =~ ^(add|remove)$ ]]; then
+  echo "[INFO] Using server: $SERVER"
+  [[ $WILDCARD -eq 1 ]] && echo "[INFO] Wildcard mode enabled"
+  validate_dns
+  validate_port
+fi
+
+# ------------------------
+# ACTION: LIST
+# ------------------------
+vhost_list() {
+  local domains=()
+
+  if [[ "$SERVER" == "caddy" ]]; then
+    for f in $CADDY_PATH/sites/*.caddy; do
+      [[ -e "$f" ]] && domains+=("$(basename "$f" .caddy)")
+    done
+  elif [[ "$SERVER" == "nginx" ]]; then
+    for f in $NGINX_PATH/sites-enabled/*; do
+      [[ -e "$f" ]] && domains+=("$(basename "$f")")
+    done
+  fi
+
+  if [[ $JSON_OUTPUT -eq 1 ]]; then
+    printf '[\n'
+    local first=1
+    for d in "${domains[@]}"; do
+      if [[ $first -eq 0 ]]; then printf ',\n'; fi
+      printf '  "%s"' "$d"
+      first=0
+    done
+    printf '\n]\n'
+  else
+    echo -e "\e[1m=== Configured Domains ($SERVER) ===\e[0m"
+    if [[ ${#domains[@]} -eq 0 ]]; then
+      echo "No domains configured yet."
+    else
+      for d in "${domains[@]}"; do
+        echo " - $d"
+      done
+    fi
+  fi
+}
+
+# ------------------------
+# ACTION: INSPECT
+# ------------------------
+vhost_inspect() {
+  local type="unknown"
+  local target="unknown"
+  local ssl="none"
+  local ssl_expiry="N/A"
+  local config_file=""
+
+  if [[ "$SERVER" == "caddy" ]]; then
+    config_file="$CADDY_PATH/sites/$DOMAIN.caddy"
+    if [[ ! -f "$config_file" ]]; then
+      [[ $JSON_OUTPUT -eq 1 ]] && echo '{"error": "Domain not found"}' || echo "[ERROR] Domain $DOMAIN not found in Caddy."
+      exit 1
+    fi
+
+    if grep -q "reverse_proxy" "$config_file"; then
+      type="proxy"
+      target=$(grep "reverse_proxy" "$config_file" | awk '{print $2}' | tr -d '{} ')
+    else
+      type="static"
+      target=$(grep "root \*" "$config_file" | awk '{print $3}' | tr -d '{} ')
+      grep -q "try_files" "$config_file" && type="spa (static)"
+    fi
+    ssl="auto-managed by Caddy"
+
+  elif [[ "$SERVER" == "nginx" ]]; then
+    config_file="$NGINX_PATH/sites-enabled/$DOMAIN"
+    if [[ ! -f "$config_file" ]]; then
+      [[ $JSON_OUTPUT -eq 1 ]] && echo '{"error": "Domain not found"}' || echo "[ERROR] Domain $DOMAIN not found in Nginx."
+      exit 1
+    fi
+
+    if grep -q "proxy_pass" "$config_file"; then
+      type="proxy"
+      target=$(grep "proxy_pass" "$config_file" | awk '{print $2}' | tr -d '; ')
+    else
+      type="static"
+      target=$(grep "root " "$config_file" | awk '{print $2}' | tr -d '; ')
+      grep -q "try_files" "$config_file" && type="spa (static)"
+    fi
+
+    local cert_file="$LETSENCRYPT_PATH/live/$DOMAIN/cert.pem"
+    if [[ -f "$cert_file" ]]; then
+      ssl="active (Let's Encrypt)"
+      # Extract expiration date using openssl
+      ssl_expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || echo "Unknown")
+    else
+      ssl="inactive (HTTP only)"
+    fi
+  fi
+
+  if [[ $JSON_OUTPUT -eq 1 ]]; then
+    cat <<EOF
+{
+  "domain": "$DOMAIN",
+  "server": "$SERVER",
+  "type": "$type",
+  "target": "$target",
+  "ssl_status": "$ssl",
+  "ssl_expiry": "$ssl_expiry"
+}
+EOF
+  else
+    echo -e "\e[1m=== Domain Inspection: $DOMAIN ===\e[0m"
+    echo " Server       : $SERVER"
+    echo " Type         : $type"
+    echo " Target       : $target"
+    echo " SSL Status   : $ssl"
+    [[ "$ssl_expiry" != "N/A" ]] && echo " SSL Expiry   : $ssl_expiry"
+    echo " Config File  : $config_file"
+  fi
+}
+
+# ------------------------
+# ACTION: ADD & REMOVE (CADDY)
+# ------------------------
+caddy_add() {
+  local FILE=$CADDY_PATH/sites/$DOMAIN.caddy
+  mkdir -p $CADDY_PATH/sites
+
+  if [[ -f "$FILE" ]]; then
+    echo "[INFO] Config already exists → skipping"
+    return
+  fi
+
+  local TARGET="$DOMAIN"
+  [[ $WILDCARD -eq 1 ]] && TARGET="*.$DOMAIN, $DOMAIN"
+
+  local CONFIG=""
+  if [[ -z "$PORT" ]]; then
+    CONFIG="$TARGET {\n  root * /var/www/$DOMAIN\n  file_server\n"
+    [[ $SPA_MODE -eq 1 ]] && CONFIG="$CONFIG  try_files {path} {path}/ /index.html\n"
+    CONFIG="$CONFIG}"
+  else
+    CONFIG="$TARGET {\n  reverse_proxy localhost:$PORT\n}"
+  fi
+
+  echo -e "$CONFIG" > $FILE
+
+  if [[ -n "$NAKED" && $WILDCARD -eq 0 ]]; then
+    echo -e "\n$NAKED {\n  redir https://$DOMAIN{uri}\n}" >> $FILE
+  fi
+
+  systemctl reload caddy
+  echo "[OK] Caddy configured"
+}
+
+caddy_remove() {
+  rm -f $CADDY_PATH/sites/$DOMAIN.caddy
+  systemctl reload caddy
+  echo "[OK] Removed from Caddy"
+}
+
+# ------------------------
+# ACTION: ADD & REMOVE (NGINX)
+# ------------------------
+nginx_add() {
+  local FILE=$NGINX_PATH/sites-available/$DOMAIN
+
+  if [[ -f "$FILE" ]]; then
+    echo "[INFO] Config exists → skipping"
+    return
+  fi
+
+  local SERVER_NAMES="$DOMAIN"
+  [[ -n "$NAKED" ]] && SERVER_NAMES="$DOMAIN $NAKED"
+  [[ $WILDCARD -eq 1 ]] && SERVER_NAMES="*.$DOMAIN $DOMAIN"
+
+  local LOCATION=""
+  if [[ -z "$PORT" ]]; then
+    LOCATION="root /var/www/$DOMAIN;\n    index index.html index.htm;"
+    [[ $SPA_MODE -eq 1 ]] && LOCATION="$LOCATION\n    location / {\n      try_files \$uri \$uri/ /index.html?\$args;\n    }"
+  else
+    LOCATION="location / {\n      proxy_pass http://localhost:$PORT;\n      proxy_set_header Host \$host;\n      proxy_set_header X-Real-IP \$remote_addr;\n      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n      proxy_set_header X-Forwarded-Proto \$scheme;\n    }"
+  fi
+
+  local CONFIG="server {\n  listen 80;\n  server_name $SERVER_NAMES;\n\n  $LOCATION\n}"
+  echo -e "$CONFIG" > $FILE
+  ln -sf $FILE $NGINX_PATH/sites-enabled/
+
+  systemctl reload nginx
+  echo "[OK] Nginx configured for HTTP"
+
+  # Let's Encrypt SSL Process
+  if [[ $WILDCARD -eq 1 ]]; then
+    echo "[WARN] Wildcard SSL requires manual DNS challenge."
+  elif command -v certbot >/dev/null 2>&1; then
+    echo "[INFO] Generating SSL certificate via Certbot..."
+    local CERTBOT_DOMAINS="-d $DOMAIN"
+    [[ -n "$NAKED" ]] && CERTBOT_DOMAINS="$CERTBOT_DOMAINS -d $NAKED"
+    
+    local EMAIL_FLAG="--register-unsafely-without-email"
+    [[ -n "$EMAIL" ]] && EMAIL_FLAG="-m $EMAIL"
+
+    certbot --nginx $CERTBOT_DOMAINS --non-interactive --agree-tos $EMAIL_FLAG --redirect || \
+    echo "[WARN] SSL generation failed. Site is running on HTTP only."
+  fi
+}
+
+nginx_remove() {
+  rm -f $NGINX_PATH/sites-enabled/$DOMAIN
+  rm -f $NGINX_PATH/sites-available/$DOMAIN
+
+  if command -v certbot >/dev/null 2>&1; then
+    certbot delete --cert-name $DOMAIN --non-interactive || true
+  fi
+
+  systemctl reload nginx
+  echo "[OK] Removed from Nginx"
+}
+
+# ------------------------
+# EXECUTION ROUTER
+# ------------------------
+case "$ACTION" in
+  add)
+    [[ "$SERVER" == "caddy" ]] && caddy_add || nginx_add
+    ;;
+  remove)
+    [[ "$SERVER" == "caddy" ]] && caddy_remove || nginx_remove
+    ;;
+  list)
+    vhost_list
+    ;;
+  inspect)
+    vhost_inspect
+    ;;
+esac
+
+[[ $JSON_OUTPUT -eq 0 && "$ACTION" =~ ^(add|remove)$ ]] && echo "[DONE]"
